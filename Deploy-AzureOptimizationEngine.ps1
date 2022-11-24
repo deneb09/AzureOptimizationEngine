@@ -504,7 +504,8 @@ if ("Y", "y" -contains $continueInput) {
     }
     else
     {
-        $upgradeManifest = Get-Content -Path "./upgrade-manifest.json" | ConvertFrom-Json
+        #$upgradeManifest = Get-Content -Path "./upgrade-manifest.json" | ConvertFrom-Json
+        $upgradeManifest = Invoke-WebRequest "https://raw.githubusercontent.com/helderpinto/AzureOptimizationEngine/master/upgrade-manifest.json" | ConvertFrom-Json
         Write-Host "Creating missing storage account containers..." -ForegroundColor Green
         $upgradeContainers = $upgradeManifest.dataCollection.container
         foreach ($container in $upgradeContainers)
@@ -839,6 +840,14 @@ if ("Y", "y" -contains $continueInput) {
 
     Write-Host "Deploying SQL Database model..." -ForegroundColor Green
     
+    # Added file update 21/11/2022
+
+    $sqlmodel = Invoke-WebRequest https://api.github.com/repos/helderpinto/AzureOptimizationEngine/contents/model
+    $sqljson = $sqlmodel | ConvertFrom-Json
+    $sqljson | ForEach-Object{
+    Invoke-WebRequest -Uri $_.Download_Url -OutFile ("./model/" + $_.Name)
+    }
+    
     $sqlPassPlain = (New-Object PSCredential "user", $sqlPass).GetNetworkCredential().Password        
     $sqlServerEndpoint = "$sqlServerName$($cloudDetails.SqlDatabaseDnsSuffix)"
     $databaseName = $sqlDatabaseName
@@ -954,6 +963,14 @@ if ("Y", "y" -contains $continueInput) {
     Write-Host "Deleting temporary SQL Server firewall rule..." -ForegroundColor Green
     Remove-AzSqlServerFirewallRule -FirewallRuleName $tempFirewallRuleName -ResourceGroupName $resourceGroupName -ServerName $sqlServerName    
 
+    #Added file update 21/11/2023
+
+    $workbooks = Invoke-WebRequest https://api.github.com/repos/helderpinto/AzureOptimizationEngine/contents/views/workbooks
+    $workbooksjson = $workbooks | ConvertFrom-Json
+    $workbooksjson | ForEach-Object{
+    Invoke-WebRequest -Uri $_.Download_Url -OutFile ("./views/workbooks/" + $_.Name)
+    }
+    
     Write-Host "Publishing workbooks..." -ForegroundColor Green
     $workbooks = Get-ChildItem -Path "./views/workbooks/" | Where-Object { $_.Name.EndsWith("-arm.json") }
     $la = Get-AzOperationalInsightsWorkspace -ResourceGroupName $laWorkspaceResourceGroup -Name $laWorkspaceName
