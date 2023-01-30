@@ -1,8 +1,8 @@
-# Azure Optimization Engine
+# Welcome to Insight Azure Guardian 
+
+## Azure Optimization Engine
 
 The Azure Optimization Engine (AOE) is an extensible solution designed to generate optimization recommendations for your Azure environment. See it like a fully customizable Azure Advisor. Actually, the first custom recommendations use-case covered by this tool was augmenting Azure Advisor Cost recommendations, particularly Virtual Machine right-sizing, with a fit score based on VM metrics and properties. Other recommendations are being added to the tool, not only for cost optimization but also for security, high availability and other [Well-Architected Framework](https://docs.microsoft.com/en-us/azure/architecture/framework/) pillars. You are welcome to contribute with new types of recommendations!
-
-It is highly recommended that you read the whole blog series dedicated to this project, starting [here](https://techcommunity.microsoft.com/t5/core-infrastructure-and-security/augmenting-azure-advisor-cost-recommendations-for-automated/ba-p/1339298). You'll find all the information needed to understand the whole solution. [Luke Murray](https://github.com/lukemurraynz) wrote a great [Azure Spring Clean 2022 blog post](https://luke.geek.nz/azure/azure-optimization-engine) describing AOE and how to set it up, with full deployment and configuration steps.
 
 ## README index
 
@@ -102,6 +102,7 @@ With AOE's Log Analytics Workbooks, you can explore many perspectives over the d
 
 ## <a id="releases"></a>Releases ##
 
+### Latest Updates: 
 * 12/2022
     * Migrated from the deprecated Consumption API to the new Cost Details API
     * Recommendations report available also in Azure Workbook (besides Power BI)
@@ -130,6 +131,8 @@ With AOE's Log Analytics Workbooks, you can explore many perspectives over the d
     * Workbooks usability improvements
     * Runbook performance improvements
     * Several bug fixes
+
+### Previous Updates: 
 * 12/2021
     * Several new recommendations added
         * **Cost** - Underutilized VM Scale Sets
