@@ -974,70 +974,82 @@ if ("Y", "y" -contains $continueInput) {
     #endregion
 
     #region Grant Azure AD role to AOE principal
-    if ($null -eq $spnId) {
+    if ($null -eq $spnId)
+    {
         $auto = Get-AzAutomationAccount -Name $automationAccountName -ResourceGroupName $resourceGroupName
         $spnId = $auto.Identity.PrincipalId
-        if ($null -eq $spnId) {
+        if ($null -eq $spnId)
+        {
             $runAsConnection = Get-AzAutomationConnection -ResourceGroupName $resourceGroupName -AutomationAccountName $automationAccountName -Name AzureRunAsConnection -ErrorAction SilentlyContinue
             $runAsAppId = $runAsConnection.FieldDefinitionValues.ApplicationId
-            if ($runAsAppId) {
+            if ($runAsAppId)
+            {
                 $runAsServicePrincipal = Get-AzADServicePrincipal -ApplicationId $runAsAppId
                 $spnId = $runAsServicePrincipal.Id
             }
         }
     }
 
-    try {
+    try
+    {
         Import-Module Microsoft.Graph.Authentication
         Import-Module Microsoft.Graph.Identity.DirectoryManagement
 
-        Write-Host "Granting Azure AD Global Reader role to the Automation Account..." -ForegroundColor Green
+        Write-Host "Granting Azure AD Global Reader role to the Automation Account (requires administrative permissions in Azure AD and MS Graph PowerShell SDK >= 2.4.0)..." -ForegroundColor Green
 
         #workaround for https://github.com/microsoftgraph/msgraph-sdk-powershell/issues/888
         $localPath = [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::UserProfile)
-        if (-not(get-item "$localPath\.graph\" -ErrorAction SilentlyContinue)) {
+        if (-not(get-item "$localPath\.graph\" -ErrorAction SilentlyContinue))
+        {
             New-Item -Type Directory "$localPath\.graph"
         }
         
-        $graphEnvironment = "Global"
-        $graphEndpointUri = "https://graph.microsoft.com"  
-        if ($AzureEnvironment -eq "AzureUSGovernment") {
-            $graphEnvironment = "USGov"
-            $graphEndpointUri = "https://graph.microsoft.us"
-        }
-        if ($AzureEnvironment -eq "AzureChinaCloud") {
-            $graphEnvironment = "China"
-            $graphEndpointUri = "https://microsoftgraph.chinacloudapi.cn"
-        }
-        if ($AzureEnvironment -eq "AzureGermanCloud") {
-            $graphEnvironment = "Germany"
-            $graphEndpointUri = "https://graph.microsoft.de"
+        switch ($cloudEnvironment) {
+            "AzureUSGovernment" {  
+                $graphEnvironment = "USGov"
+                break
+            }
+            "AzureChinaCloud" {  
+                $graphEnvironment = "China"
+                break
+            }
+            "AzureGermanCloud" {  
+                $graphEnvironment = "Germany"
+                break
+            }
+            Default {
+                $graphEnvironment = "Global"
+            }
         }
         
-        $token = Get-AzAccessToken -ResourceUrl $graphEndpointUri
-        Connect-MgGraph -AccessToken $token.Token -Environment $graphEnvironment
-
-        $globalReaderRole = Get-MgDirectoryRole -ExpandProperty Members -Property Id, Members, DisplayName, RoleTemplateId `
-        | Where-Object { $_.RoleTemplateId -eq "f2ef992c-3afb-46b9-b7cf-a126ee74c451" }
-        $globalReaders = $globalReaderRole.Members.Id
-        if (-not($globalReaders -contains $spnId)) {
-            New-MgDirectoryRoleMemberByRef -DirectoryRoleId $globalReaderRole.Id -BodyParameter @{"@odata.id" = "https://graph.microsoft.com/v1.0/directoryObjects/$spnId" }
-            Start-Sleep -Seconds 5
-            $globalReaderRole = Get-MgDirectoryRole -ExpandProperty Members -Property Id, Members, DisplayName, RoleTemplateId `
+        Connect-MgGraph -Scopes "RoleManagement.ReadWrite.Directory","Directory.Read.All" -UseDeviceAuthentication -Environment $graphEnvironment -NoWelcome
+        
+        $globalReaderRole = Get-MgDirectoryRole -ExpandProperty Members -Property Id,Members,DisplayName,RoleTemplateId `
             | Where-Object { $_.RoleTemplateId -eq "f2ef992c-3afb-46b9-b7cf-a126ee74c451" }
+        $globalReaders = $globalReaderRole.Members.Id
+        if (-not($globalReaders -contains $spnId))
+        {
+            New-MgDirectoryRoleMemberByRef -DirectoryRoleId $globalReaderRole.Id -BodyParameter @{"@odata.id" = "https://graph.microsoft.com/v1.0/directoryObjects/$spnId"}
+            Start-Sleep -Seconds 5
+            $globalReaderRole = Get-MgDirectoryRole -ExpandProperty Members -Property Id,Members,DisplayName,RoleTemplateId `
+                | Where-Object { $_.RoleTemplateId -eq "f2ef992c-3afb-46b9-b7cf-a126ee74c451" }
             $globalReaders = $globalReaderRole.Members.Id
-            if ($globalReaders -contains $spnId) {
+            if ($globalReaders -contains $spnId)
+            {
                 Write-Host "Role granted." -ForegroundColor Green
             }
-            else {
+            else
+            {
                 throw "Error when trying to grant Global Reader role"
             }
         }
-        else {
+        else
+        {
             Write-Host "Role was already granted before." -ForegroundColor Green            
         }        
     }
-    catch {
+    catch
+    {
         Write-Host $Error[0] -ForegroundColor Yellow
         Write-Host "Could not grant role. If you want Azure AD-based recommendations, please grant the Global Reader role manually to the $automationAccountName managed identity or, for previous versions of AOE, to the Run As Account principal." -ForegroundColor Red
     }
