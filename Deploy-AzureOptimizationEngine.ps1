@@ -487,7 +487,7 @@ if ("Y", "y" -contains $continueInput) {
                         -logAnalyticsWorkspaceName $laWorkspaceName -logAnalyticsWorkspaceRG $laWorkspaceResourceGroup `
                         -storageAccountName $storageAccountName -automationAccountName $automationAccountName `
                         -sqlServerName $sqlServerName -sqlDatabaseName $sqlDatabaseName -cloudEnvironment $AzureEnvironment `
-                        -sqlAdminLogin $sqlAdmin -sqlAdminPassword $sqlPass -resourceTags $ResourceTags
+                        -sqlAdminLogin $sqlAdmin -sqlAdminPassword $sqlPass
                 }
                 else {
                     $deployment = New-AzDeployment -TemplateUri $TemplateUri -Location $targetLocation -rgName $resourceGroupName -Name $deploymentName `
@@ -495,7 +495,7 @@ if ("Y", "y" -contains $continueInput) {
                         -logAnalyticsWorkspaceName $laWorkspaceName -logAnalyticsWorkspaceRG $laWorkspaceResourceGroup `
                         -storageAccountName $storageAccountName -automationAccountName $automationAccountName `
                         -sqlServerName $sqlServerName -sqlDatabaseName $sqlDatabaseName -cloudEnvironment $AzureEnvironment `
-                        -sqlAdminLogin $sqlAdmin -sqlAdminPassword $sqlPass -resourceTags $ResourceTags -artifactsLocationSasToken (ConvertTo-SecureString $ArtifactsSasToken -AsPlainText -Force)
+                        -sqlAdminLogin $sqlAdmin -sqlAdminPassword $sqlPass -artifactsLocationSasToken (ConvertTo-SecureString $ArtifactsSasToken -AsPlainText -Force)
                 }
             }
             catch {
