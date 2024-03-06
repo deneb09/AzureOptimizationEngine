@@ -11,29 +11,6 @@ if ([string]::IsNullOrEmpty($authenticationOption))
     $authenticationOption = "RunAsAccount"
 }
 
-$workspaceId = Get-AutomationVariable -Name  "AzureOptimization_LogAnalyticsWorkspaceId"
-$workspaceSubscriptionId = Get-AutomationVariable -Name  "AzureOptimization_LogAnalyticsWorkspaceSubId"
-
-$storageAccountSink = Get-AutomationVariable -Name  "AzureOptimization_StorageSink"
-$storageAccountSinkRG = Get-AutomationVariable -Name  "AzureOptimization_StorageSinkRG"
-$storageAccountSinkSubscriptionId = Get-AutomationVariable -Name  "AzureOptimization_StorageSinkSubId"
-$storageAccountSinkContainer = Get-AutomationVariable -Name  "AzureOptimization_RecommendationsContainer" -ErrorAction SilentlyContinue 
-if ([string]::IsNullOrEmpty($storageAccountSinkContainer)) {
-    $storageAccountSinkContainer = "recommendationsexports"
-}
-
-$lognamePrefix = Get-AutomationVariable -Name  "AzureOptimization_LogAnalyticsLogPrefix" -ErrorAction SilentlyContinue
-if ([string]::IsNullOrEmpty($lognamePrefix))
-{
-    $lognamePrefix = "AzureOptimization"
-}
-
-# must be less than or equal to the advisor exports frequency
-$daysBackwards = [int] (Get-AutomationVariable -Name  "AzureOptimization_RecommendAdvisorPeriodInDays" -ErrorAction SilentlyContinue)
-if (-not($daysBackwards -gt 0)) {
-    $daysBackwards = 7
-}
-
 $sqlserver = Get-AutomationVariable -Name  "AzureOptimization_SQLServerHostname"
 $sqlserverCredential = Get-AutomationPSCredential -Name "AzureOptimization_SQLServerCredential"
 $SqlUsername = $sqlserverCredential.UserName 
@@ -43,18 +20,25 @@ if ([string]::IsNullOrEmpty($sqldatabase))
 {
     $sqldatabase = "azureoptimization"
 }
-
-$CategoryFilter = Get-AutomationVariable -Name  "AzureOptimization_AdvisorFilter" -ErrorAction SilentlyContinue
-if ([string]::IsNullOrEmpty($CategoryFilter))
+$ChunkSize = [int] (Get-AutomationVariable -Name  "AzureOptimization_SQLServerInsertSize" -ErrorAction SilentlyContinue)
+if (-not($ChunkSize -gt 0))
 {
-    $CategoryFilter = "HighAvailability,Security,Performance,OperationalExcellence" # comma-separated list of categories
+    $ChunkSize = 900
 }
-
 $SqlTimeout = 120
-$LogAnalyticsIngestControlTable = "LogAnalyticsIngestControl"
-$FiltersTable = "Filters"
 
-# Authenticate against Azure
+$storageAccountSink = Get-AutomationVariable -Name  "AzureOptimization_StorageSink"
+$storageAccountSinkRG = Get-AutomationVariable -Name  "AzureOptimization_StorageSinkRG"
+$storageAccountSinkSubscriptionId = Get-AutomationVariable -Name  "AzureOptimization_StorageSinkSubId"
+$storageAccountSinkContainer = Get-AutomationVariable -Name  "AzureOptimization_RecommendationsContainer" -ErrorAction SilentlyContinue
+if ([string]::IsNullOrEmpty($storageAccountSinkContainer)) {
+    $storageAccountSinkContainer = "recommendationsexports"
+}
+$StorageBlobsPageSize = [int] (Get-AutomationVariable -Name  "AzureOptimization_StorageBlobsPageSize" -ErrorAction SilentlyContinue)
+if (-not($StorageBlobsPageSize -gt 0))
+{
+    $StorageBlobsPageSize = 1000
+}
 
 Write-Output "Logging in to Azure with $authenticationOption..."
 
@@ -65,7 +49,12 @@ switch ($authenticationOption) {
         break
     }
     "ManagedIdentity" { 
-        Connect-AzAccount -Identity
+        Connect-AzAccount -Identity -EnvironmentName $cloudEnvironment
+        break
+    }
+    "User" { 
+        $cred = Get-AutomationPSCredential –Name $authenticationCredential
+        Connect-AzAccount -Credential $cred -EnvironmentName $cloudEnvironment
         break
     }
     Default {
@@ -75,10 +64,30 @@ switch ($authenticationOption) {
     }
 }
 
-Write-Output "Finding tables where recommendations will be generated from..."
+# get reference to storage sink
+Write-Output "Getting reference to $storageAccountSink storage account (recommendations exports sink)"
+Select-AzSubscription -SubscriptionId $storageAccountSinkSubscriptionId
+$sa = Get-AzStorageAccount -ResourceGroupName $storageAccountSinkRG -Name $storageAccountSink
+
+$allblobs = @()
+
+Write-Output "Getting blobs list..."
+$continuationToken = $null
+do
+{
+    $blobs = Get-AzStorageBlob -Container $storageAccountSinkContainer -MaxCount $StorageBlobsPageSize -ContinuationToken $continuationToken -Context $sa.Context | Sort-Object -Property LastModified
+    if ($blobs.Count -le 0) { break }
+    $allblobs += $blobs
+    $continuationToken = $blobs[$blobs.Count -1].ContinuationToken;
+}
+While ($null -ne $continuationToken)
+
+$SqlServerIngestControlTable = "SqlServerIngestControl"
+$recommendationsTable = "Recommendations"
 
 $tries = 0
 $connectionSuccess = $false
+
 do {
     $tries++
     try {
@@ -87,7 +96,7 @@ do {
         $Cmd=new-object system.Data.SqlClient.SqlCommand
         $Cmd.Connection = $Conn
         $Cmd.CommandTimeout = $SqlTimeout
-        $Cmd.CommandText = "SELECT * FROM [dbo].[$LogAnalyticsIngestControlTable] WHERE CollectedType IN ('ARGVirtualMachine','AzureAdvisor','ARGResourceContainers')"
+        $Cmd.CommandText = "SELECT * FROM [dbo].[$SqlServerIngestControlTable] WHERE StorageContainerName = '$storageAccountSinkContainer' and SqlTableName = '$recommendationsTable'"
     
         $sqlAdapter = New-Object System.Data.SqlClient.SqlDataAdapter
         $sqlAdapter.SelectCommand = $Cmd
@@ -107,215 +116,172 @@ if (-not($connectionSuccess))
     throw "Could not establish connection to SQL."
 }
 
-$vmsTableName = $lognamePrefix + ($controlRows | Where-Object { $_.CollectedType -eq 'ARGVirtualMachine' }).LogAnalyticsSuffix + "_CL"
-$advisorTableName = $lognamePrefix + ($controlRows | Where-Object { $_.CollectedType -eq 'AzureAdvisor' }).LogAnalyticsSuffix + "_CL"
-$subscriptionsTableName = $lognamePrefix + ($controlRows | Where-Object { $_.CollectedType -eq 'ARGResourceContainers' }).LogAnalyticsSuffix + "_CL"
+if ($controlRows.Count -eq 0)
+{
+    throw "Could not find a control row for $storageAccountSinkContainer container and $recommendationsTable table."
+}
 
-Write-Output "Will run query against tables $vmsTableName, $subscriptionsTableName and $advisorTableName"
+$controlRow = $controlRows[0]    
+$lastProcessedLine = $controlRow.LastProcessedLine
+$lastProcessedDateTime = $controlRow.LastProcessedDateTime.ToString("yyyy'-'MM'-'dd'T'HH':'mm':'ss'.'fff'Z'")
 
 $Conn.Close()    
 $Conn.Dispose()            
 
-Write-Output "Getting excluded recommendation sub-type IDs..."
+Write-Output "Processing blobs modified after $lastProcessedDateTime (line $lastProcessedLine) and ingesting them into the Recommendations SQL table..."
 
-$tries = 0
-$connectionSuccess = $false
-do {
-    $tries++
-    try {
-        $Conn = New-Object System.Data.SqlClient.SqlConnection("Server=tcp:$sqlserver,1433;Database=$sqldatabase;User ID=$SqlUsername;Password=$SqlPass;Trusted_Connection=False;Encrypt=True;Connection Timeout=$SqlTimeout;") 
-        $Conn.Open() 
-        $Cmd=new-object system.Data.SqlClient.SqlCommand
-        $Cmd.Connection = $Conn
-        $Cmd.CommandTimeout = $SqlTimeout
-        $Cmd.CommandText = "SELECT * FROM [dbo].[$FiltersTable] WHERE FilterType = 'Exclude' AND IsEnabled = 1 AND (FilterEndDate IS NULL OR FilterEndDate > GETDATE())"
+$newProcessedTime = $null
+
+$unprocessedBlobs = @()
+
+foreach ($blob in $allblobs) {
+    $blobLastModified = $blob.LastModified.UtcDateTime.ToString("yyyy'-'MM'-'dd'T'HH':'mm':'ss'.'fff'Z'")
+    if ($lastProcessedDateTime -lt $blobLastModified -or `
+        ($lastProcessedDateTime -eq $blobLastModified -and $lastProcessedLine -gt 0)) {
+        Write-Output "$($blob.Name) found (modified on $blobLastModified)"
+        $unprocessedBlobs += $blob
+    }
+}
+
+$unprocessedBlobs = $unprocessedBlobs | Sort-Object -Property LastModified
+
+Write-Output "Found $($unprocessedBlobs.Count) new blobs to process..."
+
+foreach ($blob in $unprocessedBlobs) {
+    $newProcessedTime = $blob.LastModified.UtcDateTime.ToString("yyyy'-'MM'-'dd'T'HH':'mm':'ss'.'fff'Z'")
+    Write-Output "About to process $($blob.Name)..."
+    Get-AzStorageBlobContent -CloudBlob $blob.ICloudBlob -Context $sa.Context -Force
+    $jsonObject = Get-Content -Path $blob.Name | ConvertFrom-Json
+    Write-Output "Blob contains $($jsonObject.Count) results..."
+
+    if ($null -eq $jsonObject)
+    {
+        $recCount = 0
+    }
+    elseif ($null -eq $jsonObject.Count)
+    {
+        $recCount = 1
+    }
+    else
+    {
+        $recCount = $jsonObject.Count    
+    }
+
+    $linesProcessed = 0
+    $jsonObjectSplitted = @()
+
+    if ($recCount -gt 1)
+    {
+        for ($i = 0; $i -lt $recCount; $i += $ChunkSize) {
+            $jsonObjectSplitted += , @($jsonObject[$i..($i + ($ChunkSize - 1))]);
+        }
+    }
+    else
+    {
+        $jsonObjectArray = @()
+        $jsonObjectArray += $jsonObject
+        $jsonObjectSplitted += , $jsonObjectArray   
+    }
     
-        $sqlAdapter = New-Object System.Data.SqlClient.SqlDataAdapter
-        $sqlAdapter.SelectCommand = $Cmd
-        $filters = New-Object System.Data.DataTable
-        $sqlAdapter.Fill($filters) | Out-Null            
-        $connectionSuccess = $true
-    }
-    catch {
-        Write-Output "Failed to contact SQL at try $tries."
-        Write-Output $Error[0]
-        Start-Sleep -Seconds ($tries * 20)
-    }    
-} while (-not($connectionSuccess) -and $tries -lt 3)
-
-if (-not($connectionSuccess))
-{
-    throw "Could not establish connection to SQL."
-}
-
-$Conn.Close()    
-$Conn.Dispose()            
-
-# Grab a context reference to the Storage Account where the recommendations file will be stored
-
-Select-AzSubscription -SubscriptionId $storageAccountSinkSubscriptionId
-$sa = Get-AzStorageAccount -ResourceGroupName $storageAccountSinkRG -Name $storageAccountSink
-
-if ($workspaceSubscriptionId -ne $storageAccountSinkSubscriptionId)
-{
-    Select-AzSubscription -SubscriptionId $workspaceSubscriptionId
-}
-
-# Execute the recommendation query against Log Analytics
-
-$FinalCategoryFilter = ""
-
-if (-not([string]::IsNullOrEmpty($CategoryFilter)))
-{
-    $categories = $CategoryFilter.Split(',')
-    for ($i = 0; $i -lt $categories.Count; $i++)
+    for ($j = 0; $j -lt $jsonObjectSplitted.Count; $j++)
     {
-        $categories[$i] = "'" + $categories[$i] + "'"
-    }    
-    $FinalCategoryFilter = " and Category in (" + ($categories -join ",") + ")"
-}
-
-$baseQuery = @"
-let advisorInterval = $($daysBackwards)d;
-$advisorTableName 
-| where todatetime(TimeGenerated) > ago(advisorInterval)$FinalCategoryFilter
-| join kind=leftouter (
-    $vmsTableName 
-    | where TimeGenerated > ago(1d) 
-    | distinct InstanceId_s, Tags_s
-) on InstanceId_s 
-| extend AdvisorRecIdIndex = indexof(InstanceId_s, '/providers/microsoft.advisor/recommendations')
-| extend InstanceName_s = iif(isnotempty(InstanceName_s),InstanceName_s,iif(AdvisorRecIdIndex > 0, split(substring(InstanceId_s, 0, AdvisorRecIdIndex),'/')[-1], split(InstanceId_s,'/')[-1]))
-| summarize by InstanceId_s, InstanceName_s, Category, Description_s, SubscriptionGuid_g, TenantGuid_g, ResourceGroup, Cloud_s, AdditionalInfo_s, RecommendationText_s, ImpactedArea_s, Impact_s, RecommendationTypeId_g, Tags_s
-| join kind=leftouter ( 
-    $subscriptionsTableName
-    | where TimeGenerated > ago(1d) 
-    | where ContainerType_s =~ 'microsoft.resources/subscriptions' 
-    | project SubscriptionGuid_g, SubscriptionName = ContainerName_s 
-) on SubscriptionGuid_g
-"@
-
-Write-Output "Getting $CategoryFilter recommendations for $($daysBackwards)d Advisor..."
-
-try 
-{
-    $queryResults = Invoke-AzOperationalInsightsQuery -WorkspaceId $workspaceId -Query $baseQuery -Timespan (New-TimeSpan -Days $daysBackwards) -Wait 600 -IncludeStatistics
-    if ($queryResults)
-    {
-        $results = [System.Linq.Enumerable]::ToArray($queryResults.Results)
-    }
-}
-catch
-{
-    Write-Warning -Message "Query failed. Debug the following query in the AOE Log Analytics workspace: $baseQuery"    
-    Write-Warning -Message $error[0]
-    throw "Execution aborted"
-}
-
-Write-Output "Query finished with $($results.Count) results."
-
-Write-Output "Query statistics: $($queryResults.Statistics.query)"
-
-# Build the recommendations objects
-
-$recommendations = @()
-$datetime = (get-date).ToUniversalTime()
-$timestamp = $datetime.ToString("yyyy-MM-ddTHH:mm:00.000Z")
-
-Write-Output "Generating fit score..."
-
-foreach ($result in $results) {  
-
-    if ($filters | Where-Object { $_.RecommendationSubTypeId -eq $result.RecommendationTypeId_g})
-    {
-        continue
-    }
-
-    $tags = @{}
-
-    if (-not([string]::IsNullOrEmpty($result.Tags_s)))
-    {
-        $tagPairs = $result.Tags_s.Substring(2, $result.Tags_s.Length - 3).Split(';')
-        foreach ($tagPairString in $tagPairs)
+        if ($jsonObjectSplitted[$j])
         {
-            $tagPair = $tagPairString.Split('=')
-            if (-not([string]::IsNullOrEmpty($tagPair[0])) -and -not([string]::IsNullOrEmpty($tagPair[1])))
+            $currentObjectLines = $jsonObjectSplitted[$j].Count
+            if ($lastProcessedLine -lt $linesProcessed)
             {
-                $tagName = $tagPair[0].Trim()
-                $tagValue = $tagPair[1].Trim()
-                $tags[$tagName] = $tagValue    
+                $sqlStatement = "INSERT INTO [$recommendationsTable]"
+                $sqlStatement += " (RecommendationId, GeneratedDate, Cloud, Category, ImpactedArea, Impact, RecommendationType, RecommendationSubType,"
+                $sqlStatement += " RecommendationSubTypeId, RecommendationDescription, RecommendationAction, InstanceId, InstanceName, AdditionalInfo,"
+                $sqlStatement += " ResourceGroup, SubscriptionGuid, SubscriptionName, TenantGuid, FitScore, Tags, DetailsUrl) VALUES"
+                for ($i = 0; $i -lt $jsonObjectSplitted[$j].Count; $i++)
+                {
+                    $jsonObjectSplitted[$j][$i].RecommendationDescription = $jsonObjectSplitted[$j][$i].RecommendationDescription.Replace("'", "")
+                    $jsonObjectSplitted[$j][$i].RecommendationAction = $jsonObjectSplitted[$j][$i].RecommendationAction.Replace("'", "")            
+                    $additionalInfoString = $jsonObjectSplitted[$j][$i].AdditionalInfo | ConvertTo-Json
+                    $tagsString = $jsonObjectSplitted[$j][$i].Tags | ConvertTo-Json
+                    $subscriptionGuid = "NULL"
+                    if ($jsonObjectSplitted[$j][$i].SubscriptionGuid)
+                    {
+                        $subscriptionGuid = "'$($jsonObjectSplitted[$j][$i].SubscriptionGuid)'"
+                    }
+                    $subscriptionName = "NULL"
+                    if ($jsonObjectSplitted[$j][$i].SubscriptionName)
+                    {
+                        $subscriptionName = "'$($jsonObjectSplitted[$j][$i].SubscriptionName)'"
+                    }
+                    $resourceGroup = "NULL"
+                    if ($jsonObjectSplitted[$j][$i].ResourceGroup)
+                    {
+                        $resourceGroup = "'$($jsonObjectSplitted[$j][$i].ResourceGroup)'"
+                    }
+                    $sqlStatement += " (NEWID(), CONVERT(DATETIME, '$($jsonObjectSplitted[$j][$i].Timestamp)'), '$($jsonObjectSplitted[$j][$i].Cloud)'"
+                    $sqlStatement += ", '$($jsonObjectSplitted[$j][$i].Category)', '$($jsonObjectSplitted[$j][$i].ImpactedArea)'"
+                    $sqlStatement += ", '$($jsonObjectSplitted[$j][$i].Impact)', '$($jsonObjectSplitted[$j][$i].RecommendationType)'"
+                    $sqlStatement += ", '$($jsonObjectSplitted[$j][$i].RecommendationSubType)', '$($jsonObjectSplitted[$j][$i].RecommendationSubTypeId)'"
+                    $sqlStatement += ", '$($jsonObjectSplitted[$j][$i].RecommendationDescription)', '$($jsonObjectSplitted[$j][$i].RecommendationAction)'"
+                    $sqlStatement += ", '$($jsonObjectSplitted[$j][$i].InstanceId)', '$($jsonObjectSplitted[$j][$i].InstanceName)', '$additionalInfoString'"
+                    $sqlStatement += ", $resourceGroup, $subscriptionGuid, $subscriptionName, '$($jsonObjectSplitted[$j][$i].TenantGuid)'"
+                    $sqlStatement += ", $($jsonObjectSplitted[$j][$i].FitScore), '$tagsString', '$($jsonObjectSplitted[$j][$i].DetailsURL)')"
+                    if ($i -ne ($jsonObjectSplitted[$j].Count-1))
+                    {
+                        $sqlStatement += ","
+                    }
+                }
+        
+                $Conn2 = New-Object System.Data.SqlClient.SqlConnection("Server=tcp:$sqlserver,1433;Database=$sqldatabase;User ID=$SqlUsername;Password=$SqlPass;Trusted_Connection=False;Encrypt=True;Connection Timeout=$SqlTimeout;") 
+                $Conn2.Open() 
+        
+                $Cmd=new-object system.Data.SqlClient.SqlCommand
+                $Cmd.Connection = $Conn2
+                $Cmd.CommandText = $sqlStatement
+                $Cmd.CommandTimeout=120 
+                try
+                {
+                    $Cmd.ExecuteReader()
+                }
+                catch
+                {
+                    Write-Output "Failed statement: $sqlStatement"
+                    throw
+                }
+        
+                $Conn2.Close()                
+            
+                $linesProcessed += $currentObjectLines
+                Write-Output "Processed $linesProcessed lines..."
+                if ($j -eq ($jsonObjectSplitted.Count - 1)) {
+                    $lastProcessedLine = -1    
+                }
+                else {
+                    $lastProcessedLine = $linesProcessed - 1   
+                }
+            
+                $updatedLastProcessedLine = $lastProcessedLine
+                $updatedLastProcessedDateTime = $lastProcessedDateTime
+                if ($j -eq ($jsonObjectSplitted.Count - 1)) {
+                    $updatedLastProcessedDateTime = $newProcessedTime
+                }
+                $lastProcessedDateTime = $updatedLastProcessedDateTime
+                Write-Output "Updating last processed time / line to $($updatedLastProcessedDateTime) / $updatedLastProcessedLine"
+                $sqlStatement = "UPDATE [$SqlServerIngestControlTable] SET LastProcessedLine = $updatedLastProcessedLine, LastProcessedDateTime = '$updatedLastProcessedDateTime' WHERE StorageContainerName = '$storageAccountSinkContainer'"
+                $Conn = New-Object System.Data.SqlClient.SqlConnection("Server=tcp:$sqlserver,1433;Database=$sqldatabase;User ID=$SqlUsername;Password=$SqlPass;Trusted_Connection=False;Encrypt=True;Connection Timeout=$SqlTimeout;") 
+                $Conn.Open() 
+                $Cmd=new-object system.Data.SqlClient.SqlCommand
+                $Cmd.Connection = $Conn
+                $Cmd.CommandText = $sqlStatement
+                $Cmd.CommandTimeout=$SqlTimeout 
+                $Cmd.ExecuteReader()
+                $Conn.Close()
             }
-        }
-    }
-    
-    $additionalInfoDictionary = @{ }
-    if ($result.AdditionalInfo_s.Length -gt 0) {
-        $result.AdditionalInfo_s.Split('{')[1].Split('}')[0].Split(';') | ForEach-Object {
-            $key, $value = $_.Trim().Split('=')
-            $additionalInfoDictionary[$key] = $value
+            else
+            {
+                $linesProcessed += $currentObjectLines  
+            }        
         }
     }
 
-    $fitScore = 5
-
-    $queryInstanceId = $result.InstanceId_s
-
-    switch ($result.Cloud_s)
-    {
-        "AzureCloud" { $azureTld = "com" }
-        "AzureChinaCloud" { $azureTld = "cn" }
-        "AzureUSGovernment" { $azureTld = "us" }
-        default { $azureTld = "com" }
-    }
-
-    $detailsURL = "https://portal.azure.$azureTld/#@$($result.TenantGuid_g)/resource/$queryInstanceId/overview"
-
-    $recommendationSubType = "Advisor" + $result.Category
-
-    $recommendation = New-Object PSObject -Property @{
-        Timestamp                   = $timestamp
-        Cloud                       = $result.Cloud_s
-        Category                    = $result.Category
-        ImpactedArea                = $result.ImpactedArea_s
-        Impact                      = $result.Impact_s
-        RecommendationType          = "BestPractices"
-        RecommendationSubType       = $recommendationSubType
-        RecommendationSubTypeId     = $result.RecommendationTypeId_g
-        RecommendationDescription   = $result.Description_s.Replace("'","")
-        RecommendationAction        = $result.RecommendationText_s.Replace("'","")
-        InstanceId                  = $result.InstanceId_s
-        InstanceName                = $result.InstanceName_s
-        AdditionalInfo              = $additionalInfoDictionary
-        ResourceGroup               = $result.ResourceGroup
-        SubscriptionGuid            = $result.SubscriptionGuid_g
-        SubscriptionName            = $result.SubscriptionName
-        TenantGuid                  = $result.TenantGuid_g
-        FitScore                    = $fitScore
-        Tags                        = $tags
-        DetailsURL                  = $detailsURL
-    }
-
-    $recommendations += $recommendation    
+    Remove-Item -Path $blob.Name -Force
 }
 
-# Export the recommendations as JSON to blob storage
-
-Write-Output "Exporting final $($recommendations.Count) results as a JSON file..."
-
-$fileDate = $datetime.ToString("yyyyMMdd")
-$jsonExportPath = "advisor-asis-$fileDate.json"
-$recommendations | ConvertTo-Json | Out-File $jsonExportPath
-
-Write-Output "Uploading $jsonExportPath to blob storage..."
-
-$jsonBlobName = $jsonExportPath
-$jsonProperties = @{"ContentType" = "application/json" };
-Set-AzStorageBlobContent -File $jsonExportPath -Container $storageAccountSinkContainer -Properties $jsonProperties -Blob $jsonBlobName -Context $sa.Context -Force
-
-$now = (Get-Date).ToUniversalTime().ToString("yyyy'-'MM'-'dd'T'HH':'mm':'ss'.'fff'Z'")
-Write-Output "[$now] Uploaded $jsonBlobName to Blob Storage..."
-
-Remove-Item -Path $jsonExportPath -Force
-
-$now = (Get-Date).ToUniversalTime().ToString("yyyy'-'MM'-'dd'T'HH':'mm':'ss'.'fff'Z'")
-Write-Output "[$now] Removed $jsonExportPath from local disk..."
+Write-Output "DONE"
